@@ -4,14 +4,136 @@ import { useState, useEffect, useRef } from 'react'
 import { Send, Plus, Loader2, Paperclip, User, Bot } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { useChatStore, ChatMessage } from '@/src/stores/chatStore'
 import { ChatProcessingService } from '@/src/services/ChatProcessingService'
 import { cn } from '@/lib/utils'
+// PDF.js needs a worker; this path works with Next + pdfjs-dist
+import * as pdfjsLib from 'pdfjs-dist'
+import { createWorker, PSM, OEM } from 'tesseract.js'
+
+// @ts-expect-error - worker path for pdfjs in Next.js
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`
 
 interface ChatInterfaceProps {
   className?: string
+}
+
+// ---------- OCR Worker (singleton) ----------
+let _ocrWorker: ReturnType<typeof createWorker> | null = null
+let _ocrInit: Promise<void> | null = null
+
+async function getOCRWorker() {
+  if (_ocrWorker) return _ocrWorker
+  _ocrWorker = createWorker({
+    logger: () => {} // silence to avoid perf hits
+  })
+  if (!_ocrInit) {
+    _ocrInit = (async () => {
+      await _ocrWorker!.load()
+      await _ocrWorker!.loadLanguage('eng')
+      await _ocrWorker!.initialize('eng', OEM.LSTM_ONLY)
+      // PSM.SPARSE_TEXT gives good results for forms/receipts; we'll tune per job when calling
+    })()
+  }
+  await _ocrInit
+  return _ocrWorker!
+}
+
+// ---------- Utilities ----------
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+// Limit concurrency (avoid pegging CPU / blocking UI)
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length)
+  let i = 0
+  const workers = Array(Math.min(limit, items.length))
+    .fill(0)
+    .map(async () => {
+      while (i < items.length) {
+        const idx = i++
+        results[idx] = await fn(items[idx], idx)
+      }
+    })
+  await Promise.all(workers)
+  return results
+}
+
+// Normalize whitespace and strip OCR cruft
+function cleanText(t: string) {
+  return t
+    .replace(/\u00A0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+// Render a PDF page to a canvas and return the ImageBitmap for OCR
+async function renderPdfPageToBitmap(page: any, maxDim = 1600) {
+  const viewport = (() => {
+    const v = page.getViewport({ scale: 1.0 })
+    const scale = Math.min(maxDim / v.width, maxDim / v.height, 2.0) // cap scale
+    return page.getViewport({ scale })
+  })()
+
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D
+  canvas.width = viewport.width
+  canvas.height = viewport.height
+  await page.render({ canvasContext: ctx, viewport }).promise
+  const bitmap = await createImageBitmap(canvas)
+  // cleanup
+  canvas.width = 0; canvas.height = 0
+  return bitmap
+}
+
+// OCR an ImageBitmap or File (image/*) with adaptive settings
+async function ocrImageBitmapOrFile(input: ImageBitmap | File, opts?: { psm?: PSM; rotate?: boolean }) {
+  const worker = await getOCRWorker()
+  if (opts?.psm !== undefined) {
+    await worker.setParameters({ tessedit_pageseg_mode: String(opts.psm) })
+  } else {
+    await worker.setParameters({ tessedit_pageseg_mode: String(PSM.SPARSE_TEXT_OSD) })
+  }
+  const result = await worker.recognize(input as any) // tesseract accepts bitmap or file/blob
+  // Heuristic: if text is suspiciously empty, try a different PSM once
+  if ((result.data.text || '').trim().length < 20 && !opts?.psm) {
+    await worker.setParameters({ tessedit_pageseg_mode: String(PSM.AUTO) })
+    const retry = await worker.recognize(input as any)
+    return cleanText(retry.data.text || '')
+  }
+  return cleanText(result.data.text || '')
+}
+
+// Smart image resize (keeps EXIF orientation via createImageBitmap)
+async function resizeImageForOCR(file: File, maxDim = 1600): Promise<File> {
+  try {
+    const bitmap = await createImageBitmap(file) // respects orientation in modern browsers
+    const { width, height } = bitmap
+    const scale = Math.min(maxDim / width, maxDim / height, 1) // only downscale
+    const w = Math.round(width * scale)
+    const h = Math.round(height * scale)
+
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d', { alpha: false })!
+    ctx.drawImage(bitmap, 0, 0, w, h)
+
+    const blob = await new Promise<Blob | null>(res => canvas.toBlob(b => res(b), 'image/jpeg', 0.85))
+    if (!blob) return file
+    return new File([blob], file.name.replace(/\.(png|heic|tiff|bmp)$/i, '.jpg'), {
+      type: 'image/jpeg',
+      lastModified: Date.now()
+    })
+  } catch {
+    return file
+  }
 }
 
 export function ChatInterface({ className }: ChatInterfaceProps) {
@@ -61,7 +183,7 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
     setProcessing(true)
 
     try {
-      // Process the message for provider matching
+      // Process the message with the upgraded service
       const result = await chatProcessor.processMessage(userInput, activeChat?.messages || [])
       
       // Add assistant response
@@ -75,7 +197,7 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
       if (result.shouldCreateProviderMatches && result.metadata?.matchedProviders) {
         const notificationResult = await chatProcessor.createProviderNotifications(
           'Anonymous Patient', // TODO: Get actual patient name from auth store
-          'patient-demo-123', // TODO: Get actual patient ID from auth store
+          'patient-demo-123',  // TODO: Get actual patient ID from auth store
           userInput,
           result.metadata.matchedProviders,
           {
@@ -109,118 +231,95 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
     setInput('')
   }
 
-  // Optimized image resizing for faster OCR
-  const resizeImageForOCR = async (file: File, maxWidth = 1200, maxHeight = 1200): Promise<File> => {
-    return new Promise((resolve) => {
-      const canvas = document.createElement('canvas')
-      const ctx = canvas.getContext('2d')!
-      const img = new Image()
-      
-      img.onload = () => {
-        let { width, height } = img
-        
-        if (width > maxWidth) {
-          height = (height * maxWidth) / width
-          width = maxWidth
-        }
-        
-        if (height > maxHeight) {
-          width = (width * maxHeight) / height
-          height = maxHeight
-        }
-        
-        canvas.width = width
-        canvas.height = height
-        ctx.drawImage(img, 0, 0, width, height)
-        
-        canvas.toBlob(
-          (blob) => {
-            if (blob) {
-              const resizedFile = new File([blob], file.name, {
-                type: 'image/jpeg',
-                lastModified: Date.now()
-              })
-              resolve(resizedFile)
-            } else {
-              resolve(file)
-            }
-          },
-          'image/jpeg',
-          0.8
-        )
-      }
-      
-      img.src = URL.createObjectURL(file)
-    })
-  }
+/**
+ * Extracts text from user files:
+ * - text/plain: direct read
+ * - image/*: resize + OCR
+ * - application/pdf: try text layer; if empty/sparse, OCR selected pages (first 3 + last 2)
+ * Progressive, robust, and concurrency-limited.
+ */
+const handleFileUpload = async (files: FileList | null) => {
+  if (!files || files.length === 0) return
+  setIsUploading(true)
 
-  const handleFileUpload = async (files: FileList | null) => {
-    if (!files || files.length === 0) return
-    
-    setIsUploading(true)
-    
-    try {
-      // Process files in parallel for faster performance
-      const processFile = async (file: File): Promise<string> => {
-        try {
-          if (file.type === 'text/plain') {
-            return await file.text()
-          } 
-          else if (file.type.startsWith('image/')) {
-            // Optimize image and perform OCR
-            const optimizedFile = await resizeImageForOCR(file)
-            const Tesseract = (await import('tesseract.js')).default
-            
-            const { data } = await Tesseract.recognize(optimizedFile, 'eng', {
-              logger: () => {}, // Disable logging for performance
-              tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK,
-              tessedit_ocr_engine_mode: Tesseract.OEM.LSTM_ONLY,
-            })
-            
-            return data?.text || `[Uploaded image: ${file.name}]`
-          } 
-          else if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
-            const { getDocument } = await import('pdfjs-dist')
-            // @ts-ignore: pdfjs-dist worker in Next.js
-            const pdf = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise
-            const max = Math.min(pdf.numPages, 5)
-            
-            const pagePromises = []
-            for (let i = 1; i <= max; i++) {
-              pagePromises.push(
-                pdf.getPage(i).then(async (page) => {
-                  const content = await page.getTextContent()
-                  return content.items.map((it: any) => it.str).join(' ')
-                })
-              )
-            }
-            
-            const pageTexts = await Promise.all(pagePromises)
-            return pageTexts.join(' ')
-          } 
-          else {
-            return `[Uploaded file: ${file.name}]`
+  try {
+    const processOne = async (file: File): Promise<string> => {
+      try {
+        // 1) Plain text
+        if (file.type === 'text/plain') {
+          const t = await file.text()
+          return cleanText(t)
+        }
+
+        // 2) Images -> resize + OCR
+        if (file.type.startsWith('image/')) {
+          const optimized = await resizeImageForOCR(file, 1600)
+          const text = await ocrImageBitmapOrFile(optimized, { psm: PSM.SPARSE_TEXT_OSD })
+          return text || `[Image had no recognizable text: ${file.name}]`
+        }
+
+        // 3) PDFs
+        if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+          const arrayBuffer = await file.arrayBuffer()
+          const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise
+          const total = pdf.numPages
+
+          // Read a subset if large: first 3 + last 2 (configurable)
+          const pagesToRead = total <= 7
+            ? Array.from({ length: total }, (_, i) => i + 1)
+            : [1, 2, 3, total - 1, total]
+
+          // Try extracting text content first
+          const pageTextResults = await mapWithConcurrency(pagesToRead, 2, async (pno) => {
+            const page = await pdf.getPage(pno)
+            const content = await page.getTextContent().catch(() => null)
+            const text = content?.items?.map((it: any) => it.str).join(' ') || ''
+            return cleanText(text)
+          })
+
+          const joined = pageTextResults.join('\n').trim()
+          // If we got decent text, done; else try OCR on these pages
+          const TEXT_THRESHOLD = 60 // characters
+          if (joined.replace(/\s/g, '').length >= TEXT_THRESHOLD) {
+            return joined
           }
-        } catch (error) {
-          console.error(`Error processing file ${file.name}:`, error)
-          return `[Error processing ${file.name}]`
+
+          // OCR the selected pages (concurrency 2)
+          const ocrResults = await mapWithConcurrency(pagesToRead, 2, async (pno) => {
+            const page = await pdf.getPage(pno)
+            const bitmap = await renderPdfPageToBitmap(page, 1600)
+            const t = await ocrImageBitmapOrFile(bitmap, { psm: PSM.SPARSE_TEXT_OSD })
+            // small backoff to keep UI responsive
+            await sleep(10)
+            return `\n[Page ${pno}]\n${t}`
+          })
+
+          const ocrJoined = cleanText(ocrResults.join('\n'))
+          return ocrJoined || `[Scanned PDF contained no recognizable text: ${file.name}]`
         }
+
+        // 4) Unknowns
+        return `[Uploaded file: ${file.name}]`
+      } catch (err) {
+        console.error(`Error processing file ${file.name}:`, err)
+        return `[Error processing ${file.name}]`
       }
-
-      // Process all files in parallel
-      const results = await Promise.all(Array.from(files).map(processFile))
-      const extractedText = results.filter(text => text.trim()).join('\n')
-
-      if (extractedText.trim()) {
-        setInput(prev => (prev + '\n' + extractedText.trim()).trim())
-      }
-
-    } catch (error) {
-      console.error('File upload error:', error)
-    } finally {
-      setIsUploading(false)
     }
+
+    // Process with bounded concurrency to keep UI responsive
+    const texts = await mapWithConcurrency(Array.from(files), 2, processOne)
+    const extracted = cleanText(texts.filter(Boolean).join('\n\n'))
+
+    if (extracted) {
+      // Append to the input so the user can edit/confirm before sending
+      setInput(prev => (prev ? (prev + '\n\n' + extracted) : extracted))
+    }
+  } catch (error) {
+    console.error('File upload error:', error)
+  } finally {
+    setIsUploading(false)
   }
+}
 
   const MessageBubble = ({ message }: { message: ChatMessage }) => {
     const isUser = message.role === 'user'
@@ -256,11 +355,46 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
               {message.content}
             </div>
             
+            {/* Parsed quote summary */}
+            {message.metadata?.quote && (
+              <div className="mt-3 pt-3 border-t border-white/20">
+                <div className="text-xs opacity-75 mb-2">Parsed quote (optional upload):</div>
+                <div className="text-xs bg-white/10 rounded p-2 mb-1">
+                  {typeof message.metadata.quote.total === 'number' && (
+                    <div className="font-medium">
+                      Total: {message.metadata.quote.currency || 'USD'}{' '}
+                      {message.metadata.quote.total.toLocaleString()}
+                    </div>
+                  )}
+                  {!!message.metadata.quote.cptCodes?.length && (
+                    <div className="opacity-75 mt-1">
+                      CPT: {message.metadata.quote.cptCodes.slice(0,5).join(', ')}
+                      {message.metadata.quote.cptCodes.length > 5 ? '…' : ''}
+                    </div>
+                  )}
+                  {!!message.metadata.quote.icd10Codes?.length && (
+                    <div className="opacity-75">
+                      ICD-10: {message.metadata.quote.icd10Codes.slice(0,5).join(', ')}
+                      {message.metadata.quote.icd10Codes.length > 5 ? '…' : ''}
+                    </div>
+                  )}
+                  {!!message.metadata.quote.components?.length && (
+                    <div className="opacity-75 mt-1">
+                      Components: {message.metadata.quote.components.slice(0,3).map(c =>
+                        `${c.label}${typeof c.amount === 'number' ? ` $${c.amount}` : ''}`
+                      ).join(' | ')}
+                      {message.metadata.quote.components.length > 3 ? '…' : ''}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Provider matches */}
             {message.metadata?.isProviderMatch && message.metadata.matchedProviders && (
               <div className="mt-3 pt-3 border-t border-white/20">
                 <div className="text-xs opacity-75 mb-2">Found {message.metadata.matchedProviders.length} specialists:</div>
-                {message.metadata.matchedProviders.slice(0, 2).map((provider, index) => (
+                {message.metadata.matchedProviders.slice(0, 2).map((provider) => (
                   <div key={provider.id} className="text-xs bg-white/10 rounded p-2 mb-1">
                     <div className="font-medium">{provider.name}</div>
                     <div className="opacity-75">
@@ -346,14 +480,14 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
               Welcome to Doction AI
             </h3>
             <p className="text-gray-600 max-w-md mb-6">
-              Tell me what type of dental care you're looking for, and I'll connect you with qualified specialists in your area.
+              Tell me what procedure or care you need and your city/state. <strong>If you have a quote please upload it</strong> — totally optional.
             </p>
             <div className="flex flex-wrap gap-2 justify-center">
               {[
-                "I'm looking for an orthodontist",
-                "Need wisdom teeth removal",
-                "Find jaw surgery specialists",
-                "Dental implant consultation"
+                "Dermatology consult in Austin, TX",
+                "Compare my MRI price",
+                "Knee surgery second opinion",
+                "Primary care visit under $150"
               ].map((example) => (
                 <button
                   key={example}
@@ -364,6 +498,9 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
                 </button>
               ))}
             </div>
+            <p className="text-xs text-gray-500 mt-3">
+              Tip: <strong>If you have a quote please upload it</strong> so I can parse codes, totals, and line items for a better price match.
+            </p>
           </div>
         ) : (
           <>
@@ -398,7 +535,7 @@ export function ChatInterface({ className }: ChatInterfaceProps) {
             <Input
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask about dental care or describe what you need..."
+              placeholder="Describe your procedure + city/state (optional: If you have a quote please upload it)"
               disabled={isProcessing}
               className="pr-12"
             />

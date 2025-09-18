@@ -9,6 +9,9 @@ High-level overview
 - Data storage (current): Local storage in the browser for MVP. Replace with your DB when wiring real persistence.
 - OCR: Client-side PDF text extraction (pdfjs-dist) and image OCR (tesseract.js).
 - Notifications: Placeholder API endpoint ready to hook into Twilio/SMTP.
+- Hybrid relay: Intercom + Twilio scaffolding ready for SMS practitioner responses.
+- Auth: Clerk handles identity, session middleware, and Intercom Messenger security JWTs.
+- Payments: Calendly → Stripe scaffolding charges a $35 appointment fee to providers on booking (optional refund hook on cancel).
 - Provider data: Mock dataset in code; replace with DB-backed directory.
 
 Where the shell layout lives (navs that must exist everywhere)
@@ -16,6 +19,7 @@ Where the shell layout lives (navs that must exist everywhere)
   - Wraps all pages with:
     - Sidebar: components/sidebar.tsx
     - TopNav: components/top-nav.tsx
+    - ClerkProvider + IntercomBoot (Messenger security) + SignInReminder (5-min prompt)
   - Ensures the left and top navs persist across all routes.
 
 Primary pages and routes
@@ -98,6 +102,12 @@ Server API routes (App Router)
 
 - app/api/notify/route.ts
   - Stub for notifications. Logs requests. Replace with Twilio/SMTP call.
+- app/api/handoff/start/route.ts
+  - Starts the Intercom ↔ SMS bridge: creates/updates the patient conversation and sends SMS intros to selected practitioners.
+- app/api/intercom/webhook/route.ts
+  - Intercom webhook endpoint. Relays patient replies to every subscribed practitioner via SMS.
+- app/api/twilio/inbound/route.ts
+  - Twilio inbound SMS webhook. Posts practitioner replies back into the Intercom conversation as admin comments.
 
 Client-side state (hooks)
 - hooks/use-case.ts
@@ -193,18 +203,39 @@ Where to add real integrations
       - Update use-conversations.ts: fetch list and messages via API instead of localStorage.
   - For Neon, use @neondatabase/serverless in your server routes. [Note: do not use @vercel/postgres per project guidelines.]
 
-- Auth (email/magic link)
-  - Add a server-side auth solution (e.g., Supabase Auth) and:
-    - Gate /provider and /provider/room/[id] behind provider auth.
-    - Persist patient contact from AuthGate to your users table.
+- Auth (Clerk)
+  - Clerk now wraps the app (middleware + provider) and syncs to authStore via AuthProvider.
+  - Configure publishable/secret keys in `.env.local` and enable Intercom Messenger Security (JWT).
+  - `SignInReminder` nudges anonymous visitors after 5 minutes; adjust EXCLUDED_PATHS or duration as needed.
 
 - Notifications (Twilio/Email)
   - app/api/notify/route.ts is the hook point.
-  - Env vars to expect:
+  - Env vars to expect (basic notify):
     - TWILIO_ACCOUNT_SID
     - TWILIO_AUTH_TOKEN
     - TWILIO_FROM_NUMBER
+  - Hybrid Intercom ↔ SMS relay is scaffolded in:
+    - lib/threads.ts (in-memory thread store)
+    - lib/intercom.ts (REST helpers)
+    - lib/twilio.ts (Twilio SMS helper)
+    - app/api/handoff/start/route.ts (starts a relay thread)
+    - app/api/intercom/webhook/route.ts (relays patient → practitioner)
+    - app/api/twilio/inbound/route.ts (relays practitioner → patient)
+  - Additional env vars for the relay:
+    - INTERCOM_PAT
+    - INTERCOM_DEFAULT_ADMIN_ID
+    - NEXT_PUBLIC_INTERCOM_APP_ID
+    - INTERCOM_MESSENGER_SECRET
+    - TWILIO_MESSAGING_SERVICE_SID (or TWILIO_FROM if you prefer a dedicated number)
   - Replace console.log with Twilio client calls or SMTP send (e.g., Resend/NodeMailer).
+
+- Appointment fees (Calendly → Stripe)
+  - lib/providerBilling.ts + lib/stripe.ts provide in-memory provider records and Stripe client.
+  - app/api/billing/create-setup-intent/route.ts returns SetupIntent client secret so providers can save a card.
+  - components/ProviderCardSetup.tsx renders a Stripe Elements card form (requires NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY).
+  - app/api/calendly/webhook/route.ts validates Calendly webhook signature and charges the $35 fee (idempotent per invitee uuid).
+  - app/api/stripe/webhook/route.ts (optional) listens to setup_intent.succeeded to mark the default payment method.
+  - Env vars: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY, CALENDLY_SIGNING_KEY, APPT_FEE_CENTS, APP_BASE_URL.
 
 - Billing (Stripe)
   - Add a “post-first-client” subscription workflow:
@@ -221,6 +252,10 @@ Key file reference list
   - app/layout.tsx
   - components/sidebar.tsx
   - components/top-nav.tsx
+  - components/AuthButtons.tsx
+  - components/IntercomBoot.tsx
+  - components/SignInReminder.tsx
+  - middleware.ts
 
 - Patient home (Page 1)
   - app/page.tsx
@@ -245,6 +280,13 @@ Key file reference list
   - app/api/extract-case/route.ts    → AI profile extraction [^1]
   - app/api/match-offers/route.ts    → Offer matching (mock provider data)
   - app/api/notify/route.ts          → Notification webhook (stub)
+  - app/api/handoff/start/route.ts   → Bootstrap Intercom ↔ SMS relay
+  - app/api/intercom/webhook/route.ts→ Relay patient → practitioner via SMS
+  - app/api/twilio/inbound/route.ts  → Relay practitioner → patient into Intercom
+  - app/api/intercom/jwt/route.ts    → Clerk-authenticated Messenger security JWT
+  - app/api/billing/create-setup-intent/route.ts → Stripe SetupIntent for provider cards
+  - app/api/calendly/webhook/route.ts            → Calendly booking webhook → Stripe charge
+  - app/api/stripe/webhook/route.ts              → Stripe webhook (default payment method)
 
 - State/hooks
   - hooks/use-case.ts                → Case profile, offers, auth
@@ -252,11 +294,17 @@ Key file reference list
 
 - Data and utilities
   - lib/providers.ts                 → Mock provider directory
+  - lib/providerBilling.ts           → In-memory provider billing map (Stripe/Calendly)
   - lib/utils.ts                     → cn() helper
   - public/diverse-user-avatars.png  → Avatar image
+  - lib/stripe.ts                    → Stripe client helper
 
 How to run locally
 1) Copy .env.local.example to .env.local and add OPENAI_API_KEY.
+   - Intercom/Twilio values can stay blank for now; once accounts are ready, populate:
+     INTERCOM_PAT, INTERCOM_DEFAULT_ADMIN_ID, NEXT_PUBLIC_INTERCOM_APP_ID,
+     INTERCOM_MESSENGER_SECRET, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+     and TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM.
 2) Install and run:
    - npm install
    - npm run dev

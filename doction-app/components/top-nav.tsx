@@ -12,6 +12,7 @@ import {
 import { ChevronDown, Plus, Search, UserPlus2 } from 'lucide-react'
 import { useChatStore } from '@/src/stores/chatStore'
 import { Input } from '@/components/ui/input'
+import AuthButtons from '@/components/AuthButtons'
 
 export function TopNav() {
   const { getRecentChats, setActiveChat, createNewChat } = useChatStore()
@@ -87,6 +88,10 @@ export function TopNav() {
             <Plus className="h-4 w-4" />
             New Thread
           </Button>
+          <AuthButtons />
+        </div>
+        <div className="md:hidden ml-auto">
+          <AuthButtons />
         </div>
       </div>
     </header>

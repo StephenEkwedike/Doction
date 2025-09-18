@@ -1,19 +1,35 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import type { User } from '@/src/types'
+
+export interface ChatMessageMetadata {
+  isProviderMatch?: boolean
+  matchedProviders?: User[]
+  specialty?: string
+  location?: string
+  priceRange?: { min: number; max: number }
+  urgency?: 'low' | 'medium' | 'high'
+  intent?: 'consultation' | 'information' | 'pricing' | 'scheduling' | 'general'
+  citations?: Array<{ title: string; url: string; snippet?: string }>
+  safety?: { emergencyFlag: boolean; disclaimerShown: boolean }
+  domain?: 'medical' | 'off-domain'
+  quote?: {
+    source?: string
+    currency?: string
+    total?: number
+    components?: Array<{ label: string; amount?: number }>
+    cptCodes?: string[]
+    icd10Codes?: string[]
+    notes?: string
+  } | null
+}
 
 export interface ChatMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
   timestamp: Date
-  metadata?: {
-    isProviderMatch?: boolean
-    matchedProviders?: string[]
-    specialty?: string
-    location?: string
-    priceRange?: { min: number; max: number }
-    urgency?: 'low' | 'medium' | 'high'
-  }
+  metadata?: ChatMessageMetadata
 }
 
 export interface Chat {
